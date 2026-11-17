@@ -1,0 +1,21 @@
+{
+  "functions": [
+    {
+      "source": "src/model AI",
+      "codebase": "bisara-ai",
+      "runtime": "python313",
+      "ignore": [
+        "__pycache__",
+        "*.pyc",
+        ".venv",
+        "venv",
+        "firebase-debug.log",
+        "firebase-debug.*"
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}
