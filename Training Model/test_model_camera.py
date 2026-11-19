@@ -12,8 +12,8 @@ from landmark_features import normalize_frame
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_PATH = ROOT / "models" / "bisara_final_model.joblib"
-LANDMARKER_PATH = ROOT / "models" / "hand_landmarker.task"
+MODEL_PATH = ROOT / "src" / "model AI" / "bisara_final_model.joblib"
+LANDMARKER_PATH = ROOT / "src" / "model AI" / "hand_landmarker.task"
 CAMERA_INDEX = 1
 SEQUENCE_LENGTH = 32
 FEATURE_COUNT = 2 * 21 * 3
@@ -118,8 +118,9 @@ def predict_for_hand_count(model, features, expected_hands, observed_hands):
     score_sum = compatible_scores.sum()
     if score_sum <= 0:
         return None, 0.0
-    compatible_scores = compatible_scores / score_sum
     best = int(np.argmax(compatible_scores))
+    # Report the raw class probability, not its inflated conditional share
+    # within only the hand-compatible labels.
     return str(model.classes_[allowed[best]]), float(compatible_scores[best])
 
 

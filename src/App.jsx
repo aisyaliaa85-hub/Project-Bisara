@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { onAuthStateChanged, signOut, updateProfile } from 'firebase/auth'
+import { auth } from './firebase.js'
+import { loginWithGoogle } from './authService.js'
 import {
   ArrowDown,
   ArrowRight,
@@ -7,23 +10,28 @@ import {
   Camera,
   Check,
   ChevronRight,
-  CircleHelp,
   Clock3,
+  CircleHelp,
   Copy,
   Hand,
   Headphones,
   HeartHandshake,
   History,
-  Home,
   Info,
   LayoutDashboard,
   Languages,
   LoaderCircle,
   Mic,
   MessageSquareText,
+  Moon,
   ShieldCheck,
   Sparkles,
   Trash2,
+  Sun,
+  UserRound,
+  UserPlus,
+  LogOut,
+  KeyRound,
   Volume2,
   Waves,
   X,
@@ -47,7 +55,6 @@ const pagePaths = {
 const pathPages = Object.fromEntries(Object.entries(pagePaths).map(([key, value]) => [value, key]))
 
 const navigation = [
-  { id: 'landing', label: 'Beranda', icon: Home },
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'sign', label: 'Isyarat ke Teks', icon: Hand },
   { id: 'voice', label: 'Suara ke Teks', icon: AudioLines },
@@ -56,8 +63,23 @@ const navigation = [
 ]
 
 const waveBars = [18, 30, 43, 26, 54, 35, 22, 47, 29, 58, 34, 20, 42, 28, 51, 24, 39, 19, 47, 31, 56, 23, 38, 17, 44, 27, 52, 33, 21, 41, 25, 50, 30, 19, 45, 28]
+const ACCOUNT_STORAGE_KEY = 'bisara-saved-google-accounts'
+const readSavedAccounts = () => {
+  try { return JSON.parse(localStorage.getItem(ACCOUNT_STORAGE_KEY) || '[]') } catch { return [] }
+}
+
 const TRANSCRIPTION_API_URL = import.meta.env.VITE_TRANSCRIPTION_API_URL || 'http://127.0.0.1:8000'
-const TRANSCRIPTION_SEGMENT_MS = 5000
+const TRANSCRIPTION_SEGMENT_MS = 8000
+const SIGN_AUDIO_PATHS = {
+  halo: '/audio/signs/halo.mp3',
+  tidak: '/audio/signs/tidak.mp3',
+  ya: '/audio/signs/ya.mp3',
+  sakit: '/audio/signs/sakit.mp3',
+  maaf: '/audio/signs/maaf.mp3',
+  terima_kasih: '/audio/signs/terima_kasih.mp3',
+  tolong: '/audio/signs/tolong.mp3',
+  antre: '/audio/signs/antre.mp3',
+}
 
 function mergeTranscript(previousText, nextText) {
   const previous = previousText.trim()
@@ -86,10 +108,19 @@ function mergeTranscript(previousText, nextText) {
 
 function speakIndonesian(text) {
   if (!text || !('speechSynthesis' in window)) return false
-  window.speechSynthesis.cancel()
+  const speech = window.speechSynthesis
+  const voices = speech.getVoices()
+  const indonesianVoices = voices.filter((voice) => voice.lang?.toLowerCase().startsWith('id'))
+  const indonesianVoice = indonesianVoices.find((voice) => voice.name.toLowerCase().includes('andika'))
+    || indonesianVoices.find((voice) => voice.lang.toLowerCase() === 'id-id')
+    || indonesianVoices[0]
+  // Do not let the browser silently substitute its default English voice.
+  if (!indonesianVoice) return false
+
   const utterance = new SpeechSynthesisUtterance(text)
-  utterance.lang = 'id-ID'
-  window.speechSynthesis.speak(utterance)
+  utterance.voice = indonesianVoice
+  utterance.lang = indonesianVoice.lang || 'id-ID'
+  speech.speak(utterance)
   return true
 }
 
@@ -103,7 +134,14 @@ function Brand({ onClick, inverse = false }) {
 }
 
 function App() {
-  const [page, setPage] = useState(() => pathPages[window.location.pathname] || 'landing')
+  const [page, setPage] = useState(() => pathPages[window.location.pathname] || 'dashboard')
+  const [user, setUser] = useState(auth.currentUser)
+  const [accountOpen, setAccountOpen] = useState(false)
+  const [theme, setTheme] = useState(() => localStorage.getItem('bisara-theme') === 'dark' ? 'dark' : 'light')
+  const [savedAccounts, setSavedAccounts] = useState(readSavedAccounts)
+  const [nameDraft, setNameDraft] = useState('')
+  const [accountBusy, setAccountBusy] = useState(false)
+  const [accountMessage, setAccountMessage] = useState('')
   const [loginDestination, setLoginDestination] = useState('dashboard')
   const [cameraOn, setCameraOn] = useState(false)
   const [cameraError, setCameraError] = useState('')
@@ -118,6 +156,9 @@ function App() {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const recorderRef = useRef(null)
+  const browserRecognitionRef = useRef(null)
+  const browserRecognitionTimerRef = useRef(null)
+  const browserSpeechErrorRef = useRef(false)
   const audioStreamRef = useRef(null)
   const audioChunksRef = useRef([])
   const transcriptRef = useRef('')
@@ -129,6 +170,7 @@ function App() {
   const transcriptionQueueRef = useRef(Promise.resolve())
   const transcriptionControllersRef = useRef(new Set())
   const chunkTimerRef = useRef(null)
+  const signAudioQueueRef = useRef(Promise.resolve())
 
   const finishListeningSession = useCallback((sessionId) => {
     if (sessionId !== recordingSessionRef.current || listeningRef.current || pendingTranscriptionsRef.current > 0) return
@@ -147,6 +189,8 @@ function App() {
 
   const stopListening = useCallback(() => {
     if (startingRef.current) {
+      browserRecognitionRef.current?.abort()
+      browserRecognitionRef.current = null
       recordingSessionRef.current += 1
       startingRef.current = false
       setStartingRecording(false)
@@ -157,6 +201,11 @@ function App() {
     const sessionId = recordingSessionRef.current
     listeningRef.current = false
     setListening(false)
+    if (browserRecognitionRef.current) {
+      setVoiceStatus('processing')
+      try { browserRecognitionRef.current.stop() } catch { finishListeningSession(sessionId) }
+      return
+    }
     window.clearTimeout(chunkTimerRef.current)
     chunkTimerRef.current = null
     const recorder = recorderRef.current
@@ -176,6 +225,30 @@ function App() {
     }
   }, [cameraOn, page])
 
+  useEffect(() => onAuthStateChanged(auth, setUser), [])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    localStorage.setItem('bisara-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    if (!user?.uid) return
+    const account = { uid: user.uid, email: user.email || '', displayName: user.displayName || '', photoURL: user.photoURL || '' }
+    setSavedAccounts((accounts) => {
+      const updated = [account, ...accounts.filter((item) => item.uid !== account.uid)]
+      localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(updated))
+      return updated
+    })
+  }, [user])
+
+  useEffect(() => {
+    if (accountOpen) {
+      setNameDraft(user?.displayName || '')
+      setAccountMessage('')
+    }
+  }, [accountOpen, user])
+
   useEffect(() => {
     const handlePopState = () => {
       if (listeningRef.current || startingRef.current) stopListening()
@@ -193,6 +266,9 @@ function App() {
     transcriptionControllersRef.current.forEach((controller) => controller.abort())
     transcriptionControllersRef.current.clear()
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
+    browserRecognitionRef.current?.abort()
+    browserRecognitionRef.current = null
+    window.clearTimeout(browserRecognitionTimerRef.current)
     audioStreamRef.current?.getTracks().forEach((track) => track.stop())
   }, [])
 
@@ -210,13 +286,38 @@ function App() {
     navigate('login')
   }
 
-  const handleSignPrediction = useCallback(({ text, confidence, shouldSpeak }) => {
-    if (shouldSpeak) speakIndonesian(text)
+  const playSignAudio = useCallback((label) => {
+    const audioPath = SIGN_AUDIO_PATHS[label]
+    if (!audioPath) {
+      setNotice(`Rekaman suara untuk kata "${label}" belum disiapkan.`)
+      return
+    }
+
+    const fileName = audioPath.split('/').pop()
+    signAudioQueueRef.current = signAudioQueueRef.current.catch(() => {}).then(() => new Promise((resolve) => {
+      const audio = new Audio(audioPath)
+      let finished = false
+      const finish = (message = '') => {
+        if (finished) return
+        finished = true
+        if (message) setNotice(message)
+        resolve()
+      }
+      audio.addEventListener('ended', () => finish(), { once: true })
+      audio.addEventListener('error', () => finish(`Rekaman belum ada atau tidak bisa dibuka: public/audio/signs/${fileName}`), { once: true })
+      audio.play().catch((error) => finish(error.name === 'NotAllowedError'
+        ? 'Browser memblokir audio otomatis. Tekan tombol Dengarkan untuk memutar rekaman.'
+        : `Audio gagal diputar. Periksa file public/audio/signs/${fileName}.`))
+    }))
+  }, [])
+
+  const handleSignPrediction = useCallback(({ label, text, confidence }) => {
+    playSignAudio(label)
     setHistory((items) => {
       if (items[0]?.kind === 'isyarat' && items[0]?.text === text) return items
       return [{ text, confidence, time: 'Baru saja', kind: 'isyarat', id: Date.now() }, ...items].slice(0, 20)
     })
-  }, [])
+  }, [playSignAudio])
 
   const startCamera = async () => {
     setCameraError('')
@@ -226,7 +327,12 @@ function App() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', frameRate: { ideal: 30 } },
+        video: {
+          facingMode: 'user',
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 },
+        },
         audio: false,
       })
       streamRef.current = stream
@@ -365,7 +471,79 @@ function App() {
     setStartingRecording(true)
     setVoiceError('')
     setNotice('')
+    browserSpeechErrorRef.current = false
     try {
+      if (!import.meta.env.DEV) {
+        const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+        if (!Recognition) {
+          throw new Error('Fitur pengenal suara tidak didukung browser ini. Coba Chrome atau Edge versi terbaru.')
+        }
+        const recognition = new Recognition()
+        recognition.lang = 'id-ID'
+        recognition.continuous = true
+        recognition.interimResults = true
+        recognition.maxAlternatives = 1
+        recognition.onstart = () => {
+          if (sessionId !== recordingSessionRef.current) return
+          listeningRef.current = true
+          setListening(true)
+          setVoiceStatus('listening')
+        }
+        recognition.onresult = (event) => {
+          if (sessionId !== recordingSessionRef.current) return
+          const finalParts = []
+          const interimParts = []
+          for (let index = 0; index < event.results.length; index += 1) {
+            const result = event.results[index]
+            const text = result[0]?.transcript?.trim()
+            if (!text) continue
+            if (result.isFinal) finalParts.push(text)
+            else interimParts.push(text)
+          }
+          const finalText = finalParts.join(' ').trim()
+          const interimText = interimParts.join(' ').trim()
+          const visibleText = [finalText, interimText].filter(Boolean).join(' ').trim()
+          transcriptRef.current = visibleText
+          setTranscript(visibleText)
+          setVoiceError('')
+        }
+        recognition.onerror = (event) => {
+          if (sessionId !== recordingSessionRef.current || event.error === 'aborted') return
+          browserSpeechErrorRef.current = true
+          listeningRef.current = false
+          setListening(false)
+          setVoiceStatus('error')
+          const errors = {
+            'not-allowed': 'Izin mikrofon ditolak. Izinkan akses mikrofon pada pengaturan situs.',
+            'service-not-allowed': 'Layanan pengenal suara browser tidak diizinkan. Periksa pengaturan privasi browser.',
+            'language-not-supported': 'Browser tidak menyediakan pengenalan suara Bahasa Indonesia.',
+            'no-speech': 'Suara belum terdeteksi. Periksa mikrofon lalu coba berbicara lagi.',
+            network: 'Layanan pengenal suara browser tidak dapat dijangkau. Periksa koneksi internet.',
+          }
+          setVoiceError(errors[event.error] || `Pengenalan suara gagal (${event.error}). Coba browser lain atau periksa mikrofon.`)
+        }
+        recognition.onend = () => {
+          if (browserRecognitionRef.current !== recognition || sessionId !== recordingSessionRef.current) return
+          if (listeningRef.current && !browserSpeechErrorRef.current) {
+            browserRecognitionTimerRef.current = window.setTimeout(() => {
+              if (!listeningRef.current || browserRecognitionRef.current !== recognition) return
+              try { recognition.start() } catch {
+                listeningRef.current = false
+                setListening(false)
+                setVoiceStatus('error')
+                setVoiceError('Pengenal suara berhenti. Tekan Mulai Mendengarkan untuk mencoba lagi.')
+              }
+            }, 250)
+            return
+          }
+          browserRecognitionRef.current = null
+          if (!browserSpeechErrorRef.current) finishListeningSession(sessionId)
+        }
+        browserRecognitionRef.current = recognition
+        recognition.start()
+        return
+      }
+
       const healthResponse = await fetch(`${TRANSCRIPTION_API_URL}/health`)
       const health = await healthResponse.json().catch(() => ({}))
       if (!healthResponse.ok || !health.model_loaded) {
@@ -398,7 +576,7 @@ function App() {
         ? 'Izin mikrofon ditolak. Izinkan akses mikrofon pada pengaturan situs di browser.'
         : error.name === 'NotFoundError'
           ? 'Mikrofon tidak ditemukan. Sambungkan atau pilih perangkat mikrofon yang tersedia.'
-          : error instanceof TypeError
+          : import.meta.env.DEV && error instanceof TypeError
             ? 'Backend lokal belum aktif. Jalankan FastAPI pada http://127.0.0.1:8000 terlebih dahulu.'
             : error.message || 'Mikrofon tidak dapat dimulai. Periksa izin dan perangkat audio.')
       audioStreamRef.current?.getTracks().forEach((track) => track.stop())
@@ -444,9 +622,55 @@ function App() {
     }
   }
 
+  const accountName = user?.displayName?.trim() || user?.email?.split('@')[0] || 'Pengunjung'
+  const accountInitial = accountName.charAt(0).toLocaleUpperCase('id-ID')
+
+  const saveAccountName = async (event) => {
+    event.preventDefault()
+    const nextName = nameDraft.trim()
+    if (!auth.currentUser || !nextName) return
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      await updateProfile(auth.currentUser, { displayName: nextName })
+      setUser({ ...auth.currentUser })
+      setAccountMessage('Nama tampilan BISARA berhasil diperbarui.')
+    } catch {
+      setAccountMessage('Nama belum dapat diperbarui. Periksa koneksi lalu coba lagi.')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  const addGoogleAccount = async (loginHint = '') => {
+    setAccountBusy(true)
+    setAccountMessage('')
+    try {
+      await loginWithGoogle({ rememberMe: true, loginHint, forceAccountChooser: true })
+      setAccountMessage('Akun Google berhasil ditambahkan.')
+    } catch (error) {
+      setAccountMessage(error.message || 'Tidak dapat menambahkan akun Google.')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
+  const handleAccountSignOut = async () => {
+    setAccountBusy(true)
+    try {
+      await signOut(auth)
+      setAccountOpen(false)
+      navigate('login')
+    } catch {
+      setAccountMessage('Tidak dapat keluar dari akun. Coba lagi.')
+    } finally {
+      setAccountBusy(false)
+    }
+  }
+
   const speakText = (text) => {
     if (!speakIndonesian(text)) {
-      setNotice('Text-to-Speech tidak tersedia di browser ini.')
+      setNotice('Voice Bahasa Indonesia belum tersedia di browser/perangkat ini. Pasang voice TTS Bahasa Indonesia (Andika), lalu coba lagi.')
     }
   }
 
@@ -459,9 +683,9 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${theme === 'dark' ? 'theme-dark' : ''}`}>
       <aside className="sidebar">
-        <div className="sidebar-brand-wrap"><Brand onClick={() => navigate('landing')} /><span className="brand-caption">AI ACCESSIBILITY</span></div>
+        <div className="sidebar-brand-wrap"><Brand onClick={() => navigate('dashboard')} /><span className="brand-caption">AI ACCESSIBILITY</span></div>
         <div className="sidebar-section-label">MENU UTAMA</div>
         <nav className="side-nav" aria-label="Navigasi utama">
           {navigation.map(({ id, label, icon: Icon }) => (
@@ -483,13 +707,12 @@ function App() {
             <span className="promo-icon"><HeartHandshake size={18} /></span>
             <strong>Komunikasi milik semua.</strong>
             <p>Bersama membangun ruang yang lebih inklusif.</p>
-            <button type="button" onClick={() => navigate('about')}>Kenali BISARA <ArrowUpRight size={14} /></button>
           </div>
-          <div className="sidebar-profile">
-            <span className="profile-avatar">B</span>
-            <span className="profile-copy"><strong>Teman BISARA</strong><small>Ruang personal</small></span>
-            <span className="profile-dot" aria-label="Status aktif" />
-          </div>
+          <button className="sidebar-profile" type="button" aria-label="Buka pengelola akun dan pengaturan" onClick={() => setAccountOpen(true)}>
+            {user?.photoURL ? <img className="profile-avatar" src={user.photoURL} alt="" referrerPolicy="no-referrer" /> : <span className="profile-avatar">{accountInitial}</span>}
+            <span className="profile-copy"><strong>{accountName}</strong><small>{user?.email || 'Belum masuk'}</small></span>
+            <span className={`profile-dot ${user ? '' : 'profile-dot-off'}`} aria-label={user ? 'Akun Google aktif' : 'Belum masuk'} />
+          </button>
         </div>
       </aside>
 
@@ -514,8 +737,9 @@ function App() {
           <div className="breadcrumb"><span>Workspace</span><ChevronRight size={14} /><strong>{navigation.find((item) => item.id === page)?.label}</strong></div>
           <div className="header-actions">
             <span className="workspace-live"><span /> RUANG AMAN & PRIVAT</span>
-            <button className="help-button" type="button" onClick={() => navigate('about')}><CircleHelp size={17} /> <span>Bantuan</span></button>
-            <span className="header-avatar">B</span>
+            <button className="header-avatar account-trigger" type="button" aria-label="Buka pengelola akun" onClick={() => setAccountOpen(true)}>
+              {user?.photoURL ? <img src={user.photoURL} alt="" referrerPolicy="no-referrer" /> : accountInitial}
+            </button>
           </div>
         </header>
 
@@ -531,7 +755,7 @@ function App() {
               history={history}
               notice={notice}
               setNotice={setNotice}
-              onSpeak={speakText}
+              onSpeak={playSignAudio}
               onCopy={copyText}
               onPrediction={handleSignPrediction}
             />
@@ -543,6 +767,7 @@ function App() {
               transcript={transcript}
               voiceStatus={voiceStatus}
               voiceError={voiceError}
+              browserMode={!import.meta.env.DEV}
               clearTranscript={clearTranscript}
               startListening={startListening}
               stopListening={stopListening}
@@ -555,6 +780,56 @@ function App() {
           {page === 'about' && <AboutPage onNavigate={navigate} />}
         </div>
       </main>
+      {accountOpen && <AccountCenter
+        user={user}
+        theme={theme}
+        setTheme={setTheme}
+        savedAccounts={savedAccounts}
+        onAddAccount={addGoogleAccount}
+        onSaveName={saveAccountName}
+        onSignOut={handleAccountSignOut}
+        nameDraft={nameDraft}
+        setNameDraft={setNameDraft}
+        busy={accountBusy}
+        message={accountMessage}
+        onClose={() => setAccountOpen(false)}
+      />}
+    </div>
+  )
+}
+
+function AccountCenter({ user, theme, setTheme, savedAccounts, onAddAccount, onSaveName, onSignOut, nameDraft, setNameDraft, busy, message, onClose }) {
+  return (
+    <div className="account-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section className="account-center" role="dialog" aria-modal="true" aria-labelledby="account-center-title">
+        <header className="account-center-heading">
+          <span className="account-center-mark"><UserRound size={20} /></span>
+          <div><h2 id="account-center-title">Akun & pengaturan</h2><p>Kelola profil dan pengalaman BISARA.</p></div>
+          <button className="icon-button" type="button" aria-label="Tutup" onClick={onClose}><X size={18} /></button>
+        </header>
+        <div className="account-center-body">
+          <section className="account-section">
+            <h3>Pengelola akun</h3>
+            {user ? <>
+              <div className="account-current-user">{user.photoURL ? <img src={user.photoURL} alt="" referrerPolicy="no-referrer" /> : <span>{(user.displayName || user.email || 'B').charAt(0).toUpperCase()}</span>}<div><strong>{user.displayName || 'Pengguna BISARA'}</strong><small>{user.email}</small></div></div>
+              <form className="account-name-form" onSubmit={onSaveName}>
+                <label htmlFor="bisara-display-name">Nama tampilan BISARA</label>
+                <div><input id="bisara-display-name" value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} maxLength={80} placeholder="Masukkan nama" /><button className="button button-primary" type="submit" disabled={busy || !nameDraft.trim()}>Simpan</button></div>
+                <small>Perubahan nama ini berlaku di profil BISARA.</small>
+              </form>
+              <a className="account-security-link" href="https://myaccount.google.com/security" target="_blank" rel="noreferrer"><KeyRound size={16} /><span><strong>Ganti sandi Google</strong><small>Sandi dikelola oleh Google</small></span><ArrowUpRight size={14} /></a>
+            </> : <p className="account-empty-note">Masuk dengan Google untuk mengelola profil dan akun.</p>}
+          </section>
+          <section className="account-section">
+            <div className="account-section-heading"><h3>Akun Google</h3><button type="button" onClick={() => onAddAccount()} disabled={busy}><UserPlus size={15} /> Tambah akun</button></div>
+            {savedAccounts.length ? <div className="account-list">{savedAccounts.map((account) => <button className={`account-list-item ${user?.uid === account.uid ? 'active' : ''}`} key={account.uid} type="button" onClick={() => user?.uid !== account.uid && onAddAccount(account.email)} disabled={busy || user?.uid === account.uid}><span className="account-list-avatar">{account.photoURL ? <img src={account.photoURL} alt="" referrerPolicy="no-referrer" /> : (account.displayName || account.email || 'G').charAt(0).toUpperCase()}</span><span><strong>{account.displayName || account.email}</strong><small>{account.email}</small></span><small>{user?.uid === account.uid ? 'Aktif' : 'Pilih'}</small></button>)}</div> : <p className="account-empty-note">Akun Google lain yang pernah digunakan di perangkat ini akan muncul di sini.</p>}
+            <small className="account-section-help">Memilih akun akan membuka konfirmasi Google sebelum BISARA berpindah akun.</small>
+          </section>
+          <section className="account-section account-theme-row"><span className="account-theme-icon">{theme === 'dark' ? <Moon size={18} /> : <Sun size={18} />}</span><span><strong>Tema halaman</strong><small>{theme === 'dark' ? 'Gelap' : 'Terang'}</small></span><button className="theme-toggle" type="button" role="switch" aria-checked={theme === 'dark'} aria-label="Ganti tema terang atau gelap" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}><i /></button></section>
+          {user && <button className="account-signout" type="button" onClick={onSignOut} disabled={busy}><LogOut size={16} /> Keluar dari akun</button>}
+          {message && <p className="account-message" role="status">{message}</p>}
+        </div>
+      </section>
     </div>
   )
 }
@@ -699,7 +974,7 @@ function Dashboard({ onNavigate, history }) {
           <div className="activity-heading"><div><span className="section-kicker">AKTIVITAS TERBARU</span><h2>Jejak percakapan</h2></div><button type="button" onClick={() => onNavigate('history')}>Lihat semua <ArrowRight size={14} /></button></div>
           {history.length ? history.slice(0, 3).map((item) => <HistoryRow key={item.id} item={item} />) : <div className="activity-empty"><span><History size={19} /></span><p>Belum ada aktivitas. Riwayat percakapanmu akan muncul di sini.</p></div>}
         </div>
-        <div className="dashboard-aside-note"><span className="aside-note-icon"><ShieldCheck size={19} /></span><span className="section-kicker">RUANG YANG AMAN</span><strong>Privasi percakapanmu tetap terjaga.</strong><p>Gunakan izin kamera dan mikrofon hanya saat kamu siap. Kendali selalu ada di tanganmu.</p><button type="button" onClick={() => onNavigate('about')}>Tentang privasi <ArrowUpRight size={14} /></button></div>
+        <div className="dashboard-aside-note"><span className="aside-note-icon"><ShieldCheck size={19} /></span><span className="section-kicker">RUANG YANG AMAN</span><strong>Privasi percakapanmu tetap terjaga.</strong><p>Gunakan izin kamera dan mikrofon hanya saat kamu siap. Kendali selalu ada di tanganmu.</p></div>
       </section>
     </div>
   )
@@ -709,8 +984,9 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
   const signHistory = history.filter((item) => item.kind === 'isyarat')
   const canvasRef = useRef(null)
   const { status, error, prediction, takeProgress, startTake, cancelTake, clearPrediction } = useSignRecognition({ enabled: cameraOn, videoRef, canvasRef, onPrediction })
-  const taking = takeProgress?.phase === 'waiting' || takeProgress?.phase === 'recording'
-  const recognitionStatus = status === 'loading' ? 'MEMUAT MODEL' : status === 'waiting-for-hands' ? 'MENUNGGU TANGAN' : status === 'capturing' ? 'MEREKAM TAKE' : status === 'processing' ? 'MENGENALI TAKE' : status === 'detected' ? 'ISYARAT TERDETEKSI' : status === 'hand-mismatch' ? 'JUMLAH TANGAN BERBEDA' : status === 'low-confidence' ? 'ISYARAT BELUM JELAS' : status === 'ready' ? 'SIAP TAKE' : status === 'error' ? 'PERLU PERHATIAN' : 'MENUNGGU'
+  const taking = ['waiting', 'checking-hands', 'recording'].includes(takeProgress?.phase)
+  const predictionWarning = status === 'low-confidence' || status === 'hand-mismatch'
+  const recognitionStatus = status === 'loading' ? 'MEMUAT MODEL' : status === 'waiting-for-hands' ? 'MENUNGGU TANGAN' : status === 'checking-hands' ? 'MEMASTIKAN JUMLAH TANGAN' : status === 'capturing' ? 'MEREKAM TAKE' : status === 'processing' ? 'MENGENALI TAKE' : status === 'detected' ? 'ISYARAT TERDETEKSI' : status === 'hand-mismatch' ? 'JUMLAH TANGAN BERBEDA' : status === 'low-confidence' ? 'ISYARAT BELUM JELAS' : status === 'ready' ? 'SIAP TAKE' : status === 'error' ? 'PERLU PERHATIAN' : 'MENUNGGU'
 
   return (
     <div className="page-content translator-page">
@@ -720,9 +996,9 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
           <div className="camera-panel">
             <div className="camera-panel-top"><span className="camera-title"><span className={`status-dot ${cameraOn ? 'on' : ''}`} /> {cameraOn ? 'Kamera aktif' : 'Ruang kamera'}</span><span className="camera-top-meta"><span>BAHASA ISYARAT</span><CircleHelp size={16} /></span></div>
             <div className={`camera-view ${cameraOn ? 'camera-live' : ''}`}>
-              {cameraOn && <><video ref={videoRef} autoPlay playsInline muted aria-label="Pratinjau kamera" /><canvas ref={canvasRef} className="landmark-overlay" aria-hidden="true" />{status === 'waiting-for-hands' && <span className="camera-hand-hint">Tunjukkan tangan untuk mulai take</span>}</>}
+              {cameraOn && <><video ref={videoRef} autoPlay playsInline muted aria-label="Pratinjau kamera" /><canvas ref={canvasRef} className="landmark-overlay" aria-hidden="true" />{status === 'waiting-for-hands' && <span className="camera-hand-hint">Tunjukkan tangan untuk mulai take</span>}{status === 'checking-hands' && <span className="camera-hand-hint">Tahan posisi sebentar, BISARA sedang menghitung tangan</span>}</>}
               {!cameraOn && <div className="camera-empty"><span className="camera-empty-icon"><Camera size={28} /></span><span className="camera-grid grid-one" /><span className="camera-grid grid-two" /><strong>Kamera siap saat kamu siap.</strong><p>Posisikan diri di area terang agar gerakan tangan terlihat jelas.</p><span className="camera-tip"><Check size={14} /> Wajah dan tangan dalam bingkai</span></div>}
-              {cameraOn && <><span className="camera-live-tag"><i /> KAMERA AKTIF</span><span className="camera-detection"><span className="detection-pulse" /> {recognitionStatus}</span><span className="camera-frame frame-one" /><span className="camera-frame frame-two" /></>}
+              {cameraOn && <><span className="camera-live-tag"><i /> KAMERA AKTIF</span><span className={`camera-detection ${predictionWarning ? 'warning' : ''}`}><span className="detection-pulse" /> {recognitionStatus}</span><span className="camera-frame frame-one" /><span className="camera-frame frame-two" /></>}
               {(cameraError || error) && <p className="camera-error" role="alert">{cameraError || error}</p>}
             </div>
             <div className="take-controls">
@@ -731,7 +1007,7 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
                 <button className={`button ${taking ? 'button-stop' : 'button-primary'}`} type="button" onClick={taking ? cancelTake : startTake} disabled={!cameraOn || status === 'loading' || takeProgress?.phase === 'processing'}>
                   {taking ? <><X size={15} /> Batalkan take</> : takeProgress?.phase === 'processing' ? <><LoaderCircle className="voice-loading-icon" size={15} /> Mengenali...</> : <><Camera size={15} /> Ambil take</>}
                 </button>
-                <small>{takeProgress?.phase === 'waiting' ? 'Menunggu tangan pertama untuk memilih 45/90 frame' : takeProgress?.phase === 'recording' ? `Merekam ${takeProgress.handCount} tangan - ${takeProgress.captured}/${takeProgress.total} frame` : takeProgress?.phase === 'processing' ? 'Take selesai - model sedang mengenali' : 'Tekan Ambil take untuk mulai'}</small>
+                <small>{takeProgress?.phase === 'waiting' ? 'Menunggu tangan pertama terdeteksi' : takeProgress?.phase === 'checking-hands' ? `Menstabilkan deteksi tangan - ${takeProgress.captured}/${takeProgress.total} frame` : takeProgress?.phase === 'recording' ? `Merekam ${takeProgress.handCount} tangan - ${takeProgress.captured}/${takeProgress.total} frame` : takeProgress?.phase === 'processing' ? 'Take selesai - model sedang mengenali' : 'Tekan Ambil take untuk mulai'}</small>
               </div>
               <small className="take-mapping">1 tangan (45): Halo, Maaf, Sakit, Ya, Tidak. 2 tangan (90): Terima kasih, Tolong, Antre.</small>
             </div>
@@ -744,9 +1020,10 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
         </section>
         <section className="translation-column">
           <div className="translation-card">
-            <div className="translation-card-heading"><span className="translation-icon"><Languages size={17} /></span><span><strong>Hasil terjemahan</strong><small>{prediction ? `Keyakinan ${Math.floor(prediction.confidence * 100)}% · ${prediction.expectedHands === 2 ? 'dua tangan' : 'satu tangan'}` : cameraOn ? import.meta.env.DEV ? 'Landmark lokal · prediksi BISARA lokal' : 'Landmark lokal · prediksi Firebase' : 'Bahasa Indonesia · teks & suara'}</small></span><span className={`live-status ${cameraOn ? 'live' : ''}`}><i /> {cameraOn ? recognitionStatus : 'MENUNGGU'}</span></div>
-            {prediction ? <div className="sign-result"><span className="translation-empty-mark"><Hand size={23} /></span><strong>{prediction.text}</strong><small>{Math.floor(prediction.confidence * 100)}% keyakinan model · {prediction.shouldSpeak ? 'teks dan suara' : 'teks'}</small></div> : <div className="translation-empty"><span className="translation-empty-orbit"><span className="translation-empty-mark"><MessageSquareText size={24} /></span><i /><i /></span><strong>{cameraOn ? status === 'loading' ? 'Memuat model deteksi...' : status === 'waiting-for-hands' ? 'Menunggu tangan terdeteksi.' : status === 'capturing' ? 'Gestur sedang direkam...' : status === 'processing' ? 'Menganalisis gerakan tangan...' : status === 'stabilizing' ? 'Memastikan isyarat...' : status === 'hand-mismatch' ? 'Coba ulangi dengan jumlah tangan yang tepat.' : 'Tunjukkan isyarat di depan kamera.' : 'Terjemahanmu akan tampil di sini.'}</strong><p>{cameraOn ? 'Kamera diproses pada perangkat; urutan landmark dikirim untuk prediksi model Bahasa Isyarat BISARA.' : 'Aktifkan kamera untuk memulai deteksi isyarat Bahasa Indonesia.'}</p></div>}
-            <div className="translation-actions"><button className="button button-secondary" type="button" onClick={() => prediction?.shouldSpeak && onSpeak(prediction.text)} disabled={!prediction?.shouldSpeak} title={prediction && !prediction.shouldSpeak ? 'Ucapan tersedia mulai confidence 80%.' : undefined}><Volume2 size={16} /> Dengarkan</button><button className="button button-secondary" type="button" onClick={() => prediction && onCopy(prediction.text)} disabled={!prediction}><Copy size={15} /> Salin</button><button className="button button-quiet" type="button" onClick={() => { clearPrediction(); setNotice('Hasil isyarat dibersihkan.') }} disabled={!prediction}><Trash2 size={15} /> Hapus</button></div>
+            {predictionWarning && <div className="translation-warning" role="alert"><span className="prediction-warning-icon"><Info size={19} /></span><span className="prediction-warning-copy"><small>PERINGATAN</small><strong>{status === 'hand-mismatch' ? 'Jumlah tangan berubah saat take.' : 'Gestur belum dikenali dengan yakin.'}</strong><p>{status === 'hand-mismatch' ? 'Ulangi take dan pertahankan jumlah tangan yang sama sampai selesai.' : 'Model menolak hasil yang belum cukup yakin. Ulangi gestur dengan tangan terlihat jelas di area kamera.'}</p></span></div>}
+            <div className="translation-card-heading"><span className="translation-icon"><Languages size={17} /></span><span><strong>Hasil terjemahan</strong><small>{prediction ? `Keyakinan ${Math.floor(prediction.confidence * 100)}% · ${prediction.expectedHands === 2 ? 'dua tangan' : 'satu tangan'}` : cameraOn ? 'Landmark & model BISARA diproses di browser' : 'Bahasa Indonesia · teks & suara'}</small></span><span className={`live-status ${cameraOn ? 'live' : ''}`}><i /> {cameraOn ? recognitionStatus : 'MENUNGGU'}</span></div>
+            {prediction ? <div className="sign-result"><span className="translation-empty-mark"><Hand size={23} /></span><strong>{prediction.text}</strong><small>{Math.floor(prediction.confidence * 100)}% keyakinan model · {prediction.shouldSpeak ? 'teks dan suara' : 'teks'}</small></div> : <div className="translation-empty"><span className="translation-empty-orbit"><span className="translation-empty-mark"><MessageSquareText size={24} /></span><i /><i /></span><strong>{cameraOn ? status === 'loading' ? 'Memuat model deteksi...' : status === 'waiting-for-hands' ? 'Menunggu tangan terdeteksi.' : status === 'capturing' ? 'Gestur sedang direkam...' : status === 'processing' ? 'Menganalisis gerakan tangan...' : status === 'stabilizing' ? 'Memastikan isyarat...' : status === 'hand-mismatch' ? 'Coba ulangi dengan jumlah tangan yang tepat.' : 'Tunjukkan isyarat di depan kamera.' : 'Terjemahanmu akan tampil di sini.'}</strong><p>{cameraOn ? 'Landmark dan model prediksi diproses langsung di perangkat. Frame video tidak dikirim ke server.' : 'Aktifkan kamera untuk memulai deteksi isyarat Bahasa Indonesia.'}</p></div>}
+            <div className="translation-actions"><button className="button button-secondary" type="button" onClick={() => prediction && onSpeak(prediction.label)} disabled={!prediction}><Volume2 size={16} /> Dengarkan</button><button className="button button-secondary" type="button" onClick={() => prediction && onCopy(prediction.text)} disabled={!prediction}><Copy size={15} /> Salin</button><button className="button button-quiet" type="button" onClick={() => { clearPrediction(); setNotice('Hasil isyarat dibersihkan.') }} disabled={!prediction}><Trash2 size={15} /> Hapus</button></div>
           </div>
           {error && <p className="action-notice" role="alert">{error}</p>}
           <div className="recent-mini"><div className="recent-mini-heading"><span><History size={15} /> Riwayat isyarat</span><button type="button" onClick={() => setNotice(signHistory.length ? 'Riwayat tersedia di halaman Riwayat Terjemahan.' : 'Belum ada hasil terjemahan.')}>Lihat semua <ArrowRight size={13} /></button></div>
@@ -760,7 +1037,7 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
   )
 }
 
-function VoiceWorkspace({ listening, startingRecording, transcript, voiceStatus, voiceError, clearTranscript, startListening, stopListening, speakText, copyText, notice }) {
+function VoiceWorkspace({ listening, startingRecording, transcript, voiceStatus, voiceError, browserMode, clearTranscript, startListening, stopListening, speakText, copyText, notice }) {
   const statusLabel = startingRecording ? 'Menyiapkan mikrofon...' : voiceStatus === 'processing' ? 'Memproses suara...' : listening ? 'Mendengarkan...' : voiceStatus === 'done' ? 'Transkripsi selesai' : voiceStatus === 'error' ? 'Perlu perhatian' : 'Siap Mendengarkan'
   const transcriptStatus = startingRecording ? 'MENYIAPKAN' : voiceStatus === 'processing' ? 'MEMPROSES' : voiceStatus === 'done' ? 'SELESAI' : listening ? 'LIVE' : voiceStatus === 'error' ? 'PERIKSA' : 'KOSONG'
   return (
@@ -768,22 +1045,22 @@ function VoiceWorkspace({ listening, startingRecording, transcript, voiceStatus,
       <div className="page-heading"><div><span className="section-kicker">LIVE SPEECH TRANSCRIPTION</span><h1>Suara ke Teks</h1><p>Dengarkan percakapan dengan jelas, satu kata pada satu waktu.</p></div><span className="privacy-chip"><ShieldCheck size={15} /> PRIVAT & AMAN</span></div>
       <div className="voice-layout">
         <section className="voice-console">
-          <div className="voice-console-header"><div><span className="console-icon"><AudioLines size={17} /></span><span><strong>Studio transkripsi</strong><small>Whisper lokal · Bahasa Indonesia</small></span></div><span className={`listening-status ${listening ? 'is-listening' : ''} ${voiceStatus === 'done' ? 'is-done' : ''} ${startingRecording || voiceStatus === 'processing' ? 'is-processing' : ''}`}><i /> {startingRecording && <LoaderCircle className="voice-loading-icon" size={12} />}{statusLabel}</span></div>
+          <div className="voice-console-header"><div><span className="console-icon"><AudioLines size={17} /></span><span><strong>Studio transkripsi</strong><small>{browserMode ? 'Pengenal suara browser · Bahasa Indonesia' : 'Whisper lokal · Bahasa Indonesia'}</small></span></div><span className={`listening-status ${listening ? 'is-listening' : ''} ${voiceStatus === 'done' ? 'is-done' : ''} ${startingRecording || voiceStatus === 'processing' ? 'is-processing' : ''}`}><i /> {startingRecording && <LoaderCircle className="voice-loading-icon" size={12} />}{statusLabel}</span></div>
           <div className={`wave-stage ${listening ? 'wave-active' : ''}`}>
             <span className="wave-stage-ring ring-one" /><span className="wave-stage-ring ring-two" />
             <span className="mic-orbit orbit-a" /><span className="mic-orbit orbit-b" />
             <button className={`mic-button ${listening ? 'listening' : ''}`} type="button" onClick={listening || startingRecording ? stopListening : startListening} disabled={voiceStatus === 'processing' && !listening} aria-label={listening ? 'Berhenti mendengarkan' : startingRecording ? 'Batalkan permintaan mikrofon' : 'Mulai mendengarkan'}>{listening ? <span className="mic-stop" /> : startingRecording ? <X size={25} /> : voiceStatus === 'processing' ? <LoaderCircle className="voice-loading-icon" size={25} /> : <Mic size={27} />}</button>
             <div className="wave-bars" aria-hidden="true">{waveBars.map((height, index) => <i key={index} style={{ '--bar-height': `${height}px`, '--bar-delay': `${(index % 12) * -0.09}s` }} />)}</div>
-            <div className="wave-stage-caption"><span className="mic-hint">{startingRecording ? 'Menghubungkan backend lokal...' : voiceStatus === 'processing' ? 'Memproses segmen suara; perekaman berlanjut...' : listening ? 'Mendengarkan...' : voiceStatus === 'done' ? 'Kamu bisa mulai sesi baru kapan saja.' : 'Tekan mikrofon untuk memulai'}</span><span className="wave-locale" title="Bahasa Indonesia"><span /> id-ID</span></div>
+            <div className="wave-stage-caption"><span className="mic-hint">{startingRecording ? browserMode ? 'Menyiapkan pengenal suara...' : 'Menghubungkan backend lokal...' : voiceStatus === 'processing' ? browserMode ? 'Menyelesaikan transkripsi...' : 'Memproses segmen suara; perekaman berlanjut...' : listening ? 'Mendengarkan...' : voiceStatus === 'done' ? 'Kamu bisa mulai sesi baru kapan saja.' : 'Tekan mikrofon untuk memulai'}</span><span className="wave-locale" title="Bahasa Indonesia"><span /> id-ID</span></div>
           </div>
-          <div className="voice-console-controls"><button className={`button ${listening ? 'button-stop' : 'button-primary'}`} type="button" onClick={listening || startingRecording ? stopListening : startListening} disabled={voiceStatus === 'processing' && !listening}>{listening ? <><span className="stop-square" /> Berhenti</> : startingRecording ? <><X size={15} /> Batalkan</> : voiceStatus === 'processing' ? <><LoaderCircle className="voice-loading-icon" size={15} /> Memproses suara...</> : <><Mic size={16} /> Mulai Mendengarkan</>}</button><span><ShieldCheck size={14} /> Audio diproses di komputer ini</span></div>
+          <div className="voice-console-controls"><button className={`button ${listening ? 'button-stop' : 'button-primary'}`} type="button" onClick={listening || startingRecording ? stopListening : startListening} disabled={voiceStatus === 'processing' && !listening}>{listening ? <><span className="stop-square" /> Berhenti</> : startingRecording ? <><X size={15} /> Batalkan</> : voiceStatus === 'processing' ? <><LoaderCircle className="voice-loading-icon" size={15} /> Memproses suara...</> : <><Mic size={16} /> Mulai Mendengarkan</>}</button><span><ShieldCheck size={14} /> {browserMode ? 'Audio diproses oleh browser; layanan online mungkin digunakan.' : 'Audio diproses di komputer ini'}</span></div>
           <div className="voice-tips"><span><Sparkles size={16} /></span><p><strong>Untuk hasil yang lebih akurat</strong><small>Ucapkan dengan jelas dan kurangi suara latar di sekitarmu.</small></p></div>
         </section>
 
         <section className="transcript-panel">
-          <div className="transcript-panel-header"><div><span className="transcript-panel-icon"><MessageSquareText size={17} /></span><span><strong>Hasil transkripsi</strong><small>Transkrip dari audio yang diproses lokal</small></span></div><span className={`transcript-state state-${startingRecording ? 'processing' : voiceStatus}`}><i /> {(startingRecording || voiceStatus === 'processing') && <LoaderCircle className="voice-loading-icon" size={12} />}{transcriptStatus}</span></div>
+          <div className="transcript-panel-header"><div><span className="transcript-panel-icon"><MessageSquareText size={17} /></span><span><strong>Hasil transkripsi</strong><small>{browserMode ? 'Transkrip Bahasa Indonesia dari pengenal browser' : 'Transkrip dari audio yang diproses lokal'}</small></span></div><span className={`transcript-state state-${startingRecording ? 'processing' : voiceStatus}`}><i /> {(startingRecording || voiceStatus === 'processing') && <LoaderCircle className="voice-loading-icon" size={12} />}{transcriptStatus}</span></div>
           {voiceError && <p className="voice-error" role="alert">{voiceError}</p>}
-          {voiceStatus === 'processing' && <div className="transcript-processing" role="status"><LoaderCircle className="voice-loading-icon" size={17} /> Whisper sedang mengubah audio menjadi teks...</div>}
+          {voiceStatus === 'processing' && <div className="transcript-processing" role="status"><LoaderCircle className="voice-loading-icon" size={17} /> {browserMode ? 'Menyelesaikan transkripsi suara...' : 'Whisper sedang mengubah audio menjadi teks...'}</div>}
           <div className={`transcript-content ${transcript ? 'has-transcript' : ''}`} aria-live="polite">
             {transcript ? <p>{transcript}{listening && <span className="transcript-cursor" aria-hidden="true" />}</p> : <div className="transcript-placeholder"><span className="transcript-placeholder-art"><span><MessageSquareText size={25} /></span><i /><i /><i /></span><strong>Ruang kata-katamu</strong><span>Mulai sesi untuk menampilkan transkripsi langsung di sini.</span></div>}
           </div>
@@ -792,7 +1069,7 @@ function VoiceWorkspace({ listening, startingRecording, transcript, voiceStatus,
           {notice && <p className="action-notice transcript-notice" role="status">{notice}</p>}
         </section>
       </div>
-      <div className="workspace-footnote"><span><ShieldCheck size={14} /> Audio diproses secara lokal dan tidak disimpan.</span><span>Faster-Whisper · <button type="button" onClick={() => speakText('Transkripsi bahasa Indonesia')}>Text-to-Speech <Volume2 size={13} /></button></span></div>
+      <div className="workspace-footnote"><span><ShieldCheck size={14} /> {browserMode ? 'Audio ditangani browser; layanan online browser mungkin menerima audio.' : 'Audio diproses secara lokal dan tidak disimpan.'}</span><span>{browserMode ? 'SpeechRecognition' : 'Faster-Whisper'} · <button type="button" onClick={() => speakText('Transkripsi bahasa Indonesia')}>Text-to-Speech <Volume2 size={13} /></button></span></div>
     </div>
   )
 }
@@ -825,15 +1102,19 @@ function AboutPage({ onNavigate }) {
     <div className="page-content about-page">
       <div className="about-hero">
         <span className="about-mark"><Hand size={30} /></span><span className="section-kicker">TENTANG BISARA</span>
-        <h1>Lebih dari teknologi.<br /><span>Sebuah jembatan.</span></h1>
-        <p>BISARA hadir untuk mendekatkan orang melalui berbagai cara berkomunikasi. Karena setiap gerakan punya arti dan setiap suara layak didengar.</p>
+        <h1>MISI KAMI<br /><span>Teknologi terbaik adalah teknologi yang mendekatkan manusia.</span></h1>
+        <p>BISARA membantu membuka akses komunikasi melalui fitur pengenalan gestur tangan dan transkripsi suara. Kami ingin teknologi ini menjadi alat bantu yang mudah digunakan, sambil terus belajar dari masukan para pengguna.</p>
+        <p>Fitur isyarat BISARA mengenali beberapa gestur pilihan dan menampilkannya sebagai teks serta rekaman suara. Fitur ini belum menerjemahkan percakapan bahasa isyarat secara utuh. Fitur suara ke teks mengubah ucapan Bahasa Indonesia menjadi tulisan; cara pemrosesannya bergantung pada mode dan browser yang digunakan.</p>
         <div className="about-orbit"><span /><span /><span /></div>
       </div>
       <div className="about-pillars">
-        <div><span><HeartHandshake size={20} /></span><strong>Inklusif sejak awal</strong><p>Pengalaman dirancang agar mudah diakses dan nyaman untuk beragam cara berkomunikasi.</p></div>
-        <div><span><ShieldCheck size={20} /></span><strong>Privasi yang utama</strong><p>Kamera dan mikrofon hanya digunakan saat kamu mengaktifkannya.</p></div>
-        <div><span><Zap size={20} /></span><strong>Teknologi bermakna</strong><p>AI membantu memberi lebih banyak ruang untuk memahami satu sama lain.</p></div>
+        <div><span><HeartHandshake size={20} /></span><strong><em>01.</em> Membantu komunikasi</strong><p>Menyediakan alat bantu yang mengubah gestur tertentu menjadi teks dan suara, serta ucapan menjadi teks.</p></div>
+        <div><span><HeartHandshake size={20} /></span><strong><em>02.</em> Mendukung akses yang setara</strong><p>Mendorong pengalaman layanan dan komunikasi yang lebih mudah diakses oleh pengguna dengan kebutuhan yang beragam.</p></div>
+        <div><span><Zap size={20} /></span><strong><em>03.</em> Mengembangkan teknologi inklusif</strong><p>Menggunakan model pengenalan gestur dan teknologi transkripsi suara sebagai alat bantu komunikasi.</p></div>
+        <div><span><ShieldCheck size={20} /></span><strong><em>04.</em> Menjelaskan penggunaan data</strong><p>Kamera diproses di perangkat. Pada mode suara di situs online, browser dapat menggunakan layanan pengenalan suara online.</p></div>
+        <div><span><HeartHandshake size={20} /></span><strong><em>05.</em> Belajar bersama pengguna</strong><p>Masukan pengguna membantu BISARA memperbaiki kemudahan penggunaan, kejelasan informasi, dan dukungan gestur.</p></div>
       </div>
+      <p className="about-closing">Karena bagi kami, perbedaan cara berkomunikasi bukanlah penghalang untuk saling memahami.</p>
       <div className="about-cta"><span><Headphones size={20} /></span><div><strong>Siap memulai percakapan?</strong><small>Pilih pengalaman yang paling nyaman untukmu.</small></div><button className="button button-primary" type="button" onClick={() => onNavigate('dashboard')}>Ke dashboard <ArrowRight size={15} /></button></div>
     </div>
   )

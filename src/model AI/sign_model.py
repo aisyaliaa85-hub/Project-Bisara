@@ -12,11 +12,12 @@ import numpy as np
 from landmark_features import normalize_frame
 
 
-FEATURE_VERSION = 4
-FEATURES_PER_FRAME = 126
+FEATURE_VERSION = 5
+LANDMARK_VALUES_PER_FRAME = 126
+MODEL_FEATURES_PER_FRAME = 130
 MIN_FRAMES_WITH_HANDS = 8
 MIN_HAND_COUNT_CONSISTENCY = 0.7
-MIN_PREDICTION_CONFIDENCE = 0.7
+MIN_PREDICTION_CONFIDENCE = 0.6
 CAPTURE_SEQUENCE_LENGTH = 90
 STATIC_SEQUENCE_LENGTH = 45
 
@@ -30,13 +31,13 @@ def load_model_bundle(model_path: Path) -> dict[str, Any]:
     classifier = bundle.get("model")
     sequence_length = int(bundle.get("sequence_length", 0))
     feature_count = int(getattr(classifier, "n_features_in_", 0))
-    if sequence_length <= 0 or feature_count != sequence_length * FEATURES_PER_FRAME:
+    if sequence_length <= 0 or feature_count != sequence_length * MODEL_FEATURES_PER_FRAME:
         raise RuntimeError(
-            f"Model feature shape mismatch: expected {sequence_length * FEATURES_PER_FRAME}, got {feature_count}."
+            f"Model feature shape mismatch: expected {sequence_length * MODEL_FEATURES_PER_FRAME}, got {feature_count}."
         )
     if int(bundle.get("feature_version", 0)) != FEATURE_VERSION:
         raise RuntimeError("Landmark feature version does not match the model bundle.")
-    if bundle.get("normalization") != "shared_wrist_center_and_palm_scale":
+    if bundle.get("normalization") != "shared_wrist_center_and_palm_scale_with_wrist_image_xy":
         raise RuntimeError("Landmark normalization metadata does not match the model bundle.")
     if not isinstance(bundle.get("expected_hands"), dict):
         raise RuntimeError("Model bundle does not include expected hand-count metadata.")
@@ -62,7 +63,7 @@ def build_feature_sequence(frames: Any, sequence_length: int) -> tuple[np.ndarra
 
         landmarks = frame.get("landmarks")
         hand_present = frame.get("hand_present")
-        if not isinstance(landmarks, list) or len(landmarks) != FEATURES_PER_FRAME:
+        if not isinstance(landmarks, list) or len(landmarks) != LANDMARK_VALUES_PER_FRAME:
             raise SignInputError(f"Frame ke-{frame_index + 1} harus berisi 126 nilai landmark.")
         if not isinstance(hand_present, list) or len(hand_present) != 2:
             raise SignInputError(f"Frame ke-{frame_index + 1} harus memiliki status untuk dua tangan.")
@@ -110,7 +111,7 @@ def predict_sequence(frames: Any, bundle: dict[str, Any]) -> dict[str, Any]:
         frames,
         int(bundle["sequence_length"]),
     )
-    frame_features = features.reshape(int(bundle["sequence_length"]), 2, 63)
+    frame_features = features.reshape(int(bundle["sequence_length"]), 2, MODEL_FEATURES_PER_FRAME // 2)
     swapped_features = frame_features[:, ::-1, :].reshape(1, -1)
     candidates: list[tuple[float, str, int]] = []
     for slot_order, candidate_features in enumerate((features, swapped_features)):
@@ -123,7 +124,10 @@ def predict_sequence(frames: Any, bundle: dict[str, Any]) -> dict[str, Any]:
         if compatible_total > 0:
             for index in allowed:
                 candidate_label = str(classifier.classes_[index])
-                confidence = float(probabilities[index] / compatible_total)
+                # Keep the classifier's absolute probability. Renormalizing
+                # only among hand-compatible labels can inflate a weak guess
+                # (for example, Sakit) to an apparent near-100% confidence.
+                confidence = float(probabilities[index])
                 candidates.append((confidence, candidate_label, slot_order))
 
     hand_count_matches = bool(candidates) and hand_count_consistency >= MIN_HAND_COUNT_CONSISTENCY

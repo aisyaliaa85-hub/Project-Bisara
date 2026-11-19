@@ -38,11 +38,18 @@ function asAuthError(error) {
   )
 }
 
-export async function loginWithGoogle({ rememberMe = false } = {}) {
+export async function loginWithGoogle({ rememberMe = false, loginHint = '', forceAccountChooser = false } = {}) {
   try {
     const auth = getFirebaseAuth()
     await setPersistence(auth, rememberMe ? browserLocalPersistence : browserSessionPersistence)
-    const credential = await signInWithPopup(auth, new GoogleAuthProvider())
+    const provider = new GoogleAuthProvider()
+    if (forceAccountChooser || loginHint) {
+      provider.setCustomParameters({
+        ...(forceAccountChooser ? { prompt: 'select_account' } : {}),
+        ...(loginHint ? { login_hint: loginHint } : {}),
+      })
+    }
+    const credential = await signInWithPopup(auth, provider)
     return { credential, isNewUser: Boolean(getAdditionalUserInfo(credential)?.isNewUser) }
   } catch (error) {
     throw asAuthError(error)

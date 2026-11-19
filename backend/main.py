@@ -139,6 +139,8 @@ def transcribe_file(audio_path: str) -> str:
         task="transcribe",
         beam_size=5,
         vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400},
+        initial_prompt="Percakapan sehari-hari dalam Bahasa Indonesia.",
     )
     return " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
 

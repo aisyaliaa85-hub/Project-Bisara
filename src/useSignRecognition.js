@@ -1,19 +1,19 @@
-﻿import { useCallback, useEffect, useRef, useState } from 'react'
-import { httpsCallable } from 'firebase/functions'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import visionWasmBinaryUrl from '@mediapipe/tasks-vision/vision_wasm_internal.wasm?url'
 import visionWasmLoaderUrl from '@mediapipe/tasks-vision/vision_wasm_internal.js?url'
 import handLandmarkerModelUrl from './model AI/hand_landmarker.task?url'
-import { functions } from './firebase.js'
+import { loadSignModel, predictSignSequence } from './signModelBrowser.js'
 
 // Match the tester's take length based on the first detected hand count.
 const SINGLE_HAND_CAPTURE_FRAMES = 45
 const TWO_HAND_CAPTURE_FRAMES = 90
+const HAND_COUNT_SETTLE_FRAMES = 18
+const MAX_INFERENCE_DIMENSION = 640
 const HANDS = 2
 const POINTS_PER_HAND = 21
 const COORDINATES_PER_POINT = 3
 const FRAME_INTERVAL_MS = 33
-const TEXT_CONFIDENCE_THRESHOLD = 0.7
-const SPEECH_CONFIDENCE_THRESHOLD = 0.8
+const TEXT_CONFIDENCE_THRESHOLD = 0.6
 const MIN_LANDMARK_RATIO = 0.8
 const MIN_HAND_COUNT_CONSISTENCY = 0.8
 const WASM_FILES = {
@@ -96,7 +96,7 @@ function drawLandmarks(canvas, video, result, connections, previousLandmarks) {
     landmarks.map((point, pointIndex) => {
       const previous = previousLandmarks[handIndex]?.[pointIndex]
       if (!previous) return point
-      const oldWeight = 0.55
+      const oldWeight = 0.4
       return {
         x: previous.x * oldWeight + point.x * (1 - oldWeight),
         y: previous.y * oldWeight + point.y * (1 - oldWeight),
@@ -137,7 +137,6 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
   const [prediction, setPrediction] = useState(null)
   const [takeProgress, setTakeProgress] = useState(null)
   const predictionCallbackRef = useRef(onPrediction)
-  const lastNotifiedRef = useRef({ label: '', time: 0 })
   const pendingTakeRef = useRef(null)
   const cancelTakeRef = useRef(false)
 
@@ -171,7 +170,7 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
     let cancelled = false
     let animationFrame = 0
     let landmarker
-    let callable
+    let browserModel
     const overlayCanvas = canvasRef.current
     let activeTake = null
     let lastCapturedAt = 0
@@ -184,19 +183,7 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
 
     const classifySequence = async (sequence) => {
       try {
-        let result
-        if (import.meta.env.DEV) {
-          const response = await fetch(`${import.meta.env.VITE_TRANSCRIPTION_API_URL || 'http://127.0.0.1:8000'}/predict-sign`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ frames: sequence }),
-          })
-          result = await response.json().catch(() => ({}))
-          if (!response.ok) throw new Error(result.detail || 'Prediksi isyarat lokal gagal.')
-        } else {
-          const response = await callable({ frames: sequence })
-          result = response.data
-        }
+        const result = predictSignSequence(sequence, browserModel)
         if (cancelled) return
         const label = String(result.label || '')
         const confidence = Number(result.confidence || 0)
@@ -214,21 +201,17 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
           confidence,
           expectedHands: result.expectedHands,
           detectedHands: result.detectedHands,
-          shouldSpeak: confidence >= SPEECH_CONFIDENCE_THRESHOLD,
+          shouldSpeak: true,
         }
         setPrediction(candidate)
         setStatus('detected')
         setError('')
 
-        const now = Date.now()
-        if (lastNotifiedRef.current.label !== label || now - lastNotifiedRef.current.time > 5000) {
-          predictionCallbackRef.current?.(candidate)
-          lastNotifiedRef.current = { label, time: now }
-        }
+        predictionCallbackRef.current?.(candidate)
       } catch (requestError) {
         if (cancelled) return
         setStatus('error')
-        setError(requestError?.message || 'Prediksi isyarat gagal. Pastikan Cloud Function sudah di-deploy dan akun sudah masuk.')
+        setError(requestError?.message || 'Prediksi isyarat di browser gagal. Muat ulang halaman dan coba lagi.')
       } finally {
         setTakeProgress(null)
       }
@@ -247,9 +230,12 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
       lastTimestamp = Math.max(now, lastTimestamp + 1)
 
       try {
-        if (inferenceCanvas.width !== video.videoWidth || inferenceCanvas.height !== video.videoHeight) {
-          inferenceCanvas.width = video.videoWidth
-          inferenceCanvas.height = video.videoHeight
+        const inferenceScale = Math.min(1, MAX_INFERENCE_DIMENSION / Math.max(video.videoWidth, video.videoHeight))
+        const inferenceWidth = Math.max(1, Math.round(video.videoWidth * inferenceScale))
+        const inferenceHeight = Math.max(1, Math.round(video.videoHeight * inferenceScale))
+        if (inferenceCanvas.width !== inferenceWidth || inferenceCanvas.height !== inferenceHeight) {
+          inferenceCanvas.width = inferenceWidth
+          inferenceCanvas.height = inferenceHeight
         }
         const inferenceContext = inferenceCanvas.getContext('2d')
         if (!inferenceContext) throw new Error('Kanvas kamera tidak tersedia.')
@@ -269,7 +255,7 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
         }
 
         if (!activeTake && pendingTakeRef.current) {
-          activeTake = { ...pendingTakeRef.current, frames: [], handsSeen: [] }
+          activeTake = { ...pendingTakeRef.current, frames: [], handsSeen: [], handCountProbe: [] }
           pendingTakeRef.current = null
           previousHandCenters = Array(HANDS).fill(null)
           previousDrawnLandmarks = []
@@ -286,20 +272,43 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
 
         if (activeTake) {
           const handCount = frame.hand_present.filter(Boolean).length
+          let handCountJustLocked = false
           if (activeTake.frameCount === 0 && handCount > 0) {
-            activeTake.handCount = handCount
-            activeTake.frameCount = handCount === 2
-              ? TWO_HAND_CAPTURE_FRAMES
-              : SINGLE_HAND_CAPTURE_FRAMES
+            activeTake.handCountProbe.push({ frame, handCount })
+            if (activeTake.handCountProbe.length >= HAND_COUNT_SETTLE_FRAMES) {
+              const twoHandDetections = activeTake.handCountProbe.filter((sample) => sample.handCount === 2).length
+              activeTake.handCount = twoHandDetections >= 2 ? 2 : 1
+              activeTake.frameCount = activeTake.handCount === 2
+                ? TWO_HAND_CAPTURE_FRAMES
+                : SINGLE_HAND_CAPTURE_FRAMES
+              // Ignore early single-hand frames while the second hand is still
+              // entering view; retain only warm-up frames matching the decision.
+              activeTake.handCountProbe
+                .filter((sample) => sample.handCount === activeTake.handCount)
+                .forEach((sample) => {
+                  activeTake.frames.push(sample.frame)
+                  activeTake.handsSeen.push(sample.handCount)
+                })
+              activeTake.handCountProbe = []
+              handCountJustLocked = true
+            } else {
+              setTakeProgress({
+                phase: 'checking-hands',
+                captured: activeTake.handCountProbe.length,
+                total: HAND_COUNT_SETTLE_FRAMES,
+                handCount: 0,
+              })
+              setStatus('checking-hands')
+            }
           }
-          // Count only frames where MediaPipe currently detects at least one hand.
-          if (handCount > 0) {
+          // Capture only detected-hand frames; don't duplicate the last probe frame.
+          if (activeTake.frameCount > 0 && handCount > 0 && !handCountJustLocked) {
             activeTake.frames.push(frame)
             activeTake.handsSeen.push(handCount)
           }
 
           if (activeTake.frames.length === 0) {
-            setStatus('waiting-for-hands')
+            if (activeTake.handCountProbe.length === 0) setStatus('waiting-for-hands')
           } else {
             const progress = {
               phase: 'recording',
@@ -354,6 +363,7 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
       setStatus('loading')
       setError('')
       try {
+        const signModelPromise = loadSignModel()
         const { HandLandmarker } = await import('@mediapipe/tasks-vision')
         handConnections = HandLandmarker.HAND_CONNECTIONS
         const options = {
@@ -374,7 +384,7 @@ export function useSignRecognition({ enabled, videoRef, canvasRef, onPrediction 
             baseOptions: { modelAssetPath: handLandmarkerModelUrl, delegate: 'CPU' },
           })
         }
-        callable = httpsCallable(functions, 'predict_sign')
+        browserModel = await signModelPromise
         if (cancelled) {
           landmarker.close()
           return

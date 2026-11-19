@@ -14,8 +14,8 @@ from landmark_features import normalize_frame
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA = ROOT / "dataset" / "raw" / "gestures_final.csv"
-DEFAULT_MODEL = ROOT / "models" / "bisara_final_model.joblib"
+DEFAULT_DATA = ROOT / "Training Model" / "gestures_final.csv"
+DEFAULT_MODEL = ROOT / "src" / "model AI" / "bisara_final_model.joblib"
 CLASS_NAMES = {
     "halo", "antre", "maaf", "sakit", "ya", "tidak",
     "terima_kasih", "tolong",
@@ -170,8 +170,8 @@ def main():
             "model": model,
             "sequence_length": SEQUENCE_LENGTH,
             "classes": model.classes_.tolist(),
-            "feature_version": 4,
-            "normalization": "shared_wrist_center_and_palm_scale",
+            "feature_version": 5,
+            "normalization": "shared_wrist_center_and_palm_scale_with_wrist_image_xy",
             "expected_hands": expected_hands,
         },
         args.model,

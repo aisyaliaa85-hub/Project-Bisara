@@ -6,12 +6,14 @@ import numpy as np
 HAND_COUNT = 2
 POINTS_PER_HAND = 21
 AXES_PER_POINT = 3
-FEATURE_COUNT = HAND_COUNT * POINTS_PER_HAND * AXES_PER_POINT
+LANDMARK_FEATURE_COUNT = HAND_COUNT * POINTS_PER_HAND * AXES_PER_POINT
+FEATURES_PER_HAND = POINTS_PER_HAND * AXES_PER_POINT + 2
+FEATURE_COUNT = HAND_COUNT * FEATURES_PER_HAND
 PALM_SCALE_FLOOR = 1e-4
 
 
 def normalize_frame(frame, hand_present):
-    """Remove absolute image position/scale while retaining hand-to-hand layout."""
+    """Normalize hand shape while preserving each wrist's image position."""
     landmarks = np.asarray(frame, dtype=np.float32).reshape(
         HAND_COUNT, POINTS_PER_HAND, AXES_PER_POINT
     ).copy()
@@ -19,6 +21,8 @@ def normalize_frame(frame, hand_present):
     active = np.flatnonzero(present)
     if active.size == 0:
         return np.zeros(FEATURE_COUNT, dtype=np.float32)
+
+    wrist_positions = landmarks[:, 0, :2].copy()
 
     # Use the midpoint of detected wrists as origin. With one hand, this is
     # that hand's wrist; with two, the relative wrist spacing remains intact.
@@ -35,4 +39,8 @@ def normalize_frame(frame, hand_present):
         if not present[index]:
             landmarks[index] = 0.0
 
-    return landmarks.reshape(FEATURE_COUNT)
+    hand_features = np.concatenate(
+        (landmarks.reshape(HAND_COUNT, POINTS_PER_HAND * AXES_PER_POINT), wrist_positions),
+        axis=1,
+    )
+    return hand_features.reshape(-1)
