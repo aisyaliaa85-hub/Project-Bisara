@@ -36,6 +36,8 @@ import {
   Waves,
   X,
   Zap,
+  RotateCcw,
+  Play,
 } from 'lucide-react'
 import Login from './Login.jsx'
 import { useSignRecognition } from './useSignRecognition.js'
@@ -45,6 +47,7 @@ const pagePaths = {
   landing: '/',
   dashboard: '/dashboard',
   sign: '/sign',
+  gestures: '/gestures',
   voice: '/voice',
   history: '/history',
   about: '/about',
@@ -57,6 +60,7 @@ const pathPages = Object.fromEntries(Object.entries(pagePaths).map(([key, value]
 const navigation = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'sign', label: 'Isyarat ke Teks', icon: Hand },
+  { id: 'gestures', label: 'Panduan Gerakan', icon: Play },
   { id: 'voice', label: 'Suara ke Teks', icon: AudioLines },
   { id: 'history', label: 'Riwayat Terjemahan', icon: History },
   { id: 'about', label: 'Tentang BISARA', icon: Info },
@@ -145,6 +149,7 @@ function App() {
   const [loginDestination, setLoginDestination] = useState('dashboard')
   const [cameraOn, setCameraOn] = useState(false)
   const [cameraError, setCameraError] = useState('')
+  const [cameraFacing, setCameraFacing] = useState('environment')
   const [listening, setListening] = useState(false)
   const [startingRecording, setStartingRecording] = useState(false)
   const [transcript, setTranscript] = useState('')
@@ -326,9 +331,10 @@ function App() {
       return
     }
     try {
+     streamRef.current?.getTracks().forEach((track) => track.stop())
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: 'user',
+          facingMode: { ideal: cameraFacing },
           width: { ideal: 640 },
           height: { ideal: 480 },
           frameRate: { ideal: 30 },
@@ -337,6 +343,7 @@ function App() {
       })
       streamRef.current = stream
       setCameraOn(true)
+     if (videoRef.current) videoRef.current.srcObject = stream
     } catch (error) {
       setCameraError(error.name === 'NotAllowedError'
         ? 'Izin kamera belum diberikan. Periksa pengaturan browser Anda.'
@@ -348,6 +355,34 @@ function App() {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     setCameraOn(false)
+  }
+
+  const switchCamera = async () => {
+    const nextFacing = cameraFacing === 'user' ? 'environment' : 'user'
+    setCameraFacing(nextFacing)
+    if (!cameraOn) return
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    streamRef.current = null
+    setCameraOn(false)
+    setCameraError('')
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { exact: nextFacing },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 },
+        },
+        audio: false,
+      })
+      streamRef.current = stream
+      setCameraOn(true)
+      if (videoRef.current) videoRef.current.srcObject = stream
+    } catch (error) {
+      setCameraError(error.name === 'OverconstrainedError'
+        ? 'Perangkat ini tidak menyediakan kamera dengan arah tersebut.'
+        : 'Kamera tidak dapat dialihkan. Coba aktifkan ulang kamera.')
+    }
   }
 
   const transcribeAudioSegment = (audioBlob, sessionId) => {
@@ -749,9 +784,11 @@ function App() {
             <SignWorkspace
               cameraOn={cameraOn}
               cameraError={cameraError}
+              cameraFacing={cameraFacing}
               videoRef={videoRef}
               startCamera={startCamera}
               stopCamera={stopCamera}
+              switchCamera={switchCamera}
               history={history}
               notice={notice}
               setNotice={setNotice}
@@ -760,6 +797,7 @@ function App() {
               onPrediction={handleSignPrediction}
             />
           )}
+          {page === 'gestures' && <GestureGuidePage onNavigate={navigate} />}
           {page === 'voice' && (
             <VoiceWorkspace
               listening={listening}
@@ -909,7 +947,7 @@ function LandingPage({ onNavigate, onRequestLogin, mobileMenuOpen, setMobileMenu
                 <span className="feature-bottom">Mulai berisyarat <ArrowRight size={15} /></span><span className="feature-decoration"><Hand size={150} strokeWidth={.9} /></span>
               </button>
               <button className="feature-card feature-voice" type="button" onClick={() => onRequestLogin('voice')}>
-                <span className="feature-card-index">02 / LIVE TRANSCRIPTION</span><span className="feature-icon"><Mic size={24} /></span><span className="feature-arrow"><ArrowUpRight size={18} /></span>
+                <span className="feature-card-index">02 / LIVE TRANSKRIPSI</span><span className="feature-icon"><Mic size={24} /></span><span className="feature-arrow"><ArrowUpRight size={18} /></span>
                 <strong>Suara ke teks</strong><span className="feature-text">Ubah percakapan menjadi tulisan secara langsung agar semua orang bisa mengikuti.</span>
                 <span className="feature-bottom">Mulai mendengarkan <ArrowRight size={15} /></span><span className="feature-decoration voice-decoration"><AudioLines size={150} strokeWidth={.9} /></span>
               </button>
@@ -980,7 +1018,7 @@ function Dashboard({ onNavigate, history }) {
   )
 }
 
-function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamera, history, notice, setNotice, onSpeak, onCopy, onPrediction }) {
+function SignWorkspace({ cameraOn, cameraError, cameraFacing, videoRef, startCamera, stopCamera, switchCamera, history, notice, setNotice, onSpeak, onCopy, onPrediction }) {
   const signHistory = history.filter((item) => item.kind === 'isyarat')
   const canvasRef = useRef(null)
   const { status, error, prediction, takeProgress, startTake, cancelTake, clearPrediction } = useSignRecognition({ enabled: cameraOn, videoRef, canvasRef, onPrediction })
@@ -995,7 +1033,7 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
         <section className="camera-column">
           <div className="camera-panel">
             <div className="camera-panel-top"><span className="camera-title"><span className={`status-dot ${cameraOn ? 'on' : ''}`} /> {cameraOn ? 'Kamera aktif' : 'Ruang kamera'}</span><span className="camera-top-meta"><span>BAHASA ISYARAT</span><CircleHelp size={16} /></span></div>
-            <div className={`camera-view ${cameraOn ? 'camera-live' : ''}`}>
+            <div className={`camera-view ${cameraOn ? 'camera-live' : ''} ${cameraOn && cameraFacing === 'environment' ? 'camera-back' : ''}`}>
               {cameraOn && <><video ref={videoRef} autoPlay playsInline muted aria-label="Pratinjau kamera" /><canvas ref={canvasRef} className="landmark-overlay" aria-hidden="true" />{status === 'waiting-for-hands' && <span className="camera-hand-hint">Tunjukkan tangan untuk mulai take</span>}{status === 'checking-hands' && <span className="camera-hand-hint">Tahan posisi sebentar, BISARA sedang menghitung tangan</span>}</>}
               {!cameraOn && <div className="camera-empty"><span className="camera-empty-icon"><Camera size={28} /></span><span className="camera-grid grid-one" /><span className="camera-grid grid-two" /><strong>Kamera siap saat kamu siap.</strong><p>Posisikan diri di area terang agar gerakan tangan terlihat jelas.</p><span className="camera-tip"><Check size={14} /> Wajah dan tangan dalam bingkai</span></div>}
               {cameraOn && <><span className="camera-live-tag"><i /> KAMERA AKTIF</span><span className={`camera-detection ${predictionWarning ? 'warning' : ''}`}><span className="detection-pulse" /> {recognitionStatus}</span><span className="camera-frame frame-one" /><span className="camera-frame frame-two" /></>}
@@ -1012,8 +1050,11 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
               <small className="take-mapping">1 tangan (45): Halo, Maaf, Sakit, Ya, Tidak. 2 tangan (90): Terima kasih, Tolong, Antre.</small>
             </div>
             <div className="camera-controls">
-              <div className="camera-device"><span className={`device-indicator ${cameraOn ? 'active' : ''}`} /><span><strong>Kamera perangkat</strong><small>{cameraOn ? 'Aktif · hanya saat digunakan' : 'Belum terhubung'}</small></span></div>
+              <div className="camera-device"><span className={`device-indicator ${cameraOn ? 'active' : ''}`} /><span><strong>Kamera perangkat</strong><small>{cameraOn ? `Aktif · ${cameraFacing === 'user' ? 'kamera depan' : 'kamera belakang'}` : 'Belum terhubung'}</small></span></div>
+             <div className="camera-control-actions">
+               {cameraOn && <button className="button button-secondary" type="button" onClick={switchCamera}><RotateCcw size={15} /> {cameraFacing === 'user' ? 'Kamera belakang' : 'Kamera depan'}</button>}
               <button className={`button ${cameraOn ? 'button-stop' : 'button-primary'}`} type="button" onClick={cameraOn ? () => { cancelTake(); stopCamera() } : startCamera}>{cameraOn ? <><span className="stop-square" /> Matikan kamera</> : <><Camera size={16} /> Aktifkan kamera</>}</button>
+             </div>
             </div>
           </div>
           <div className="camera-helper"><span className="helper-icon"><ShieldCheck size={16} /></span><p><strong>Kendali tetap di tanganmu.</strong> BISARA hanya menggunakan kamera setelah kamu mengizinkannya.</p></div>
@@ -1022,7 +1063,7 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
           <div className="translation-card">
             {predictionWarning && <div className="translation-warning" role="alert"><span className="prediction-warning-icon"><Info size={19} /></span><span className="prediction-warning-copy"><small>PERINGATAN</small><strong>{status === 'hand-mismatch' ? 'Jumlah tangan berubah saat take.' : 'Gestur belum dikenali dengan yakin.'}</strong><p>{status === 'hand-mismatch' ? 'Ulangi take dan pertahankan jumlah tangan yang sama sampai selesai.' : 'Model menolak hasil yang belum cukup yakin. Ulangi gestur dengan tangan terlihat jelas di area kamera.'}</p></span></div>}
             <div className="translation-card-heading"><span className="translation-icon"><Languages size={17} /></span><span><strong>Hasil terjemahan</strong><small>{prediction ? `Keyakinan ${Math.floor(prediction.confidence * 100)}% · ${prediction.expectedHands === 2 ? 'dua tangan' : 'satu tangan'}` : cameraOn ? 'Landmark & model BISARA diproses di browser' : 'Bahasa Indonesia · teks & suara'}</small></span><span className={`live-status ${cameraOn ? 'live' : ''}`}><i /> {cameraOn ? recognitionStatus : 'MENUNGGU'}</span></div>
-            {prediction ? <div className="sign-result"><span className="translation-empty-mark"><Hand size={23} /></span><strong>{prediction.text}</strong><small>{Math.floor(prediction.confidence * 100)}% keyakinan model · {prediction.shouldSpeak ? 'teks dan suara' : 'teks'}</small></div> : <div className="translation-empty"><span className="translation-empty-orbit"><span className="translation-empty-mark"><MessageSquareText size={24} /></span><i /><i /></span><strong>{cameraOn ? status === 'loading' ? 'Memuat model deteksi...' : status === 'waiting-for-hands' ? 'Menunggu tangan terdeteksi.' : status === 'capturing' ? 'Gestur sedang direkam...' : status === 'processing' ? 'Menganalisis gerakan tangan...' : status === 'stabilizing' ? 'Memastikan isyarat...' : status === 'hand-mismatch' ? 'Coba ulangi dengan jumlah tangan yang tepat.' : 'Tunjukkan isyarat di depan kamera.' : 'Terjemahanmu akan tampil di sini.'}</strong><p>{cameraOn ? 'Landmark dan model prediksi diproses langsung di perangkat. Frame video tidak dikirim ke server.' : 'Aktifkan kamera untuk memulai deteksi isyarat Bahasa Indonesia.'}</p></div>}
+            {prediction ? <div className="sign-result"><span className="translation-empty-mark"><Hand size={23} /></span><strong>{prediction.text}</strong><small>{Math.floor(prediction.confidence * 100)}% keyakinan model · {prediction.shouldSpeak ? 'teks dan suara' : 'teks'}</small></div> : <div className="translation-empty"><span className="translation-empty-orbit"><span className="translation-empty-mark"><MessageSquareText size={24} /></span><i /><i /></span><strong>{cameraOn ? status === 'loading' ? 'Memuat model deteksi...' : status === 'waiting-for-hands' ? 'Menunggu tangan terdeteksi.' : status === 'capturing' ? 'Gestur sedang direkam...' : status === 'processing' ? 'Menganalisis gerakan tangan...' : status === 'stabilizing' ? 'Memastikan isyarat...' : status === 'hand-mismatch' ? 'Coba ulangi dengan jumlah tangan yang tepat.' : 'Tunjukkan isyarat di depan kamera.' : 'Aktifkan kamera untuk memulai deteksi isyarat Bahasa Indonesia.'}</strong><p>{cameraOn ? 'Landmark dan model prediksi diproses langsung di perangkat. Frame video tidak dikirim ke server.' : 'Aktifkan kamera untuk memulai deteksi isyarat Bahasa Indonesia.'}</p></div>}
             <div className="translation-actions"><button className="button button-secondary" type="button" onClick={() => prediction && onSpeak(prediction.label)} disabled={!prediction}><Volume2 size={16} /> Dengarkan</button><button className="button button-secondary" type="button" onClick={() => prediction && onCopy(prediction.text)} disabled={!prediction}><Copy size={15} /> Salin</button><button className="button button-quiet" type="button" onClick={() => { clearPrediction(); setNotice('Hasil isyarat dibersihkan.') }} disabled={!prediction}><Trash2 size={15} /> Hapus</button></div>
           </div>
           {error && <p className="action-notice" role="alert">{error}</p>}
@@ -1037,14 +1078,80 @@ function SignWorkspace({ cameraOn, cameraError, videoRef, startCamera, stopCamer
   )
 }
 
+function GestureGuidePage({ onNavigate }) {
+  const [activeVideo, setActiveVideo] = useState(null)
+  const gestures = [
+    { label: 'Halo', hands: '1 tangan', file: '/video gestur/Hallo.mp4' },
+    { label: 'Antre', hands: '2 tangan', file: '/video gestur/antre.mp4' },
+    { label: 'Maaf', hands: '1 tangan', file: '/video gestur/maaf.mp4' },
+    { label: 'Sakit', hands: '1 tangan', file: '/video gestur/sakit.mp4' },
+    { label: 'Tidak', hands: '1 tangan', file: '/video gestur/tidak.mp4' },
+    { label: 'Ya', hands: '1 tangan', file: '/video gestur/ya.mp4' },
+  ]
+
+  return (
+    <div className="page-content gesture-guide-page">
+      <div className="page-heading">
+        <div><span className="section-kicker">CONTOH INTERAKSI</span><h1>Panduan Gerakan Isyarat</h1><p>Tonton contoh gerakan sebelum melakukan take di depan kamera.</p></div>
+        <button className="button button-primary" type="button" onClick={() => onNavigate('sign')}><Camera size={16} /> Mulai Isyarat</button>
+      </div>
+
+      <div className="gesture-grid">
+        {gestures.map((gesture) => (
+          <article className="gesture-card" key={gesture.label}>
+            <button className="gesture-video-wrap gesture-local-preview" type="button" onClick={() => setActiveVideo({ file: gesture.file, title: `Contoh gerakan ${gesture.label}`, local: true })} aria-label={`Putar contoh ${gesture.label}`}>
+              <video src={gesture.file} muted preload="metadata" playsInline aria-hidden="true" />
+              <span className="youtube-play gesture-play"><Play size={22} fill="currentColor" /></span>
+              <span className="gesture-hands">{gesture.hands}</span>
+            </button>
+            <div className="gesture-card-info"><span><strong>{gesture.label}</strong><small>Video gerakan isyarat BISARA</small></span></div>
+          </article>
+        ))}
+        <article className="gesture-card gesture-youtube-card">
+          <button className="gesture-video-wrap youtube-preview" type="button" onClick={() => setActiveVideo({ id: 'PDUR6gccHCI', title: 'Contoh gerakan isyarat Terima kasih' })} aria-label="Putar video Terima kasih">
+            <img src="https://i.ytimg.com/vi/PDUR6gccHCI/hqdefault.jpg" alt="Preview gerakan isyarat Terima kasih" />
+            <span className="youtube-play"><Play size={22} fill="currentColor" /></span>
+            <span className="gesture-hands">2 tangan</span>
+          </button>
+          <div className="gesture-card-info"><span><strong>Terima kasih</strong><small>Video contoh dari YouTube</small></span></div>
+        </article>
+
+        <article className="gesture-card gesture-youtube-card">
+          <button className="gesture-video-wrap youtube-preview" type="button" onClick={() => setActiveVideo({ id: '72fMAG0InKo', title: 'Contoh gerakan isyarat Tolong' })} aria-label="Putar video Tolong">
+            <img src="https://i.ytimg.com/vi/72fMAG0InKo/hqdefault.jpg" alt="Preview gerakan isyarat Tolong" />
+            <span className="youtube-play"><Play size={22} fill="currentColor" /></span>
+            <span className="gesture-hands">2 tangan</span>
+          </button>
+          <div className="gesture-card-info"><span><strong>Tolong</strong><small>Video contoh dari YouTube</small></span></div>
+        </article>
+      </div>
+
+      {activeVideo && (
+        <div className="youtube-modal" role="dialog" aria-modal="true" aria-label={activeVideo.title} onMouseDown={(event) => { if (event.target === event.currentTarget) setActiveVideo(null) }}>
+          <div className="youtube-modal-content">
+            <button className="youtube-modal-close" type="button" aria-label="Tutup video" onClick={() => setActiveVideo(null)}><X size={18} /></button>
+            <div className="youtube-modal-player">
+              {activeVideo.local
+                ? <video src={activeVideo.file} controls autoPlay playsInline preload="metadata" aria-label={activeVideo.title} />
+                : <iframe src={`https://www.youtube-nocookie.com/embed/${activeVideo.id}?autoplay=1&rel=0&playsinline=1`} title={activeVideo.title} allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerPolicy="strict-origin-when-cross-origin" allowFullScreen />}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function VoiceWorkspace({ listening, startingRecording, transcript, voiceStatus, voiceError, browserMode, clearTranscript, startListening, stopListening, speakText, copyText, notice }) {
   const statusLabel = startingRecording ? 'Menyiapkan mikrofon...' : voiceStatus === 'processing' ? 'Memproses suara...' : listening ? 'Mendengarkan...' : voiceStatus === 'done' ? 'Transkripsi selesai' : voiceStatus === 'error' ? 'Perlu perhatian' : 'Siap Mendengarkan'
   const transcriptStatus = startingRecording ? 'MENYIAPKAN' : voiceStatus === 'processing' ? 'MEMPROSES' : voiceStatus === 'done' ? 'SELESAI' : listening ? 'LIVE' : voiceStatus === 'error' ? 'PERIKSA' : 'KOSONG'
   return (
     <div className="page-content voice-page">
       <div className="page-heading"><div><span className="section-kicker">LIVE SPEECH TRANSCRIPTION</span><h1>Suara ke Teks</h1><p>Dengarkan percakapan dengan jelas, satu kata pada satu waktu.</p></div><span className="privacy-chip"><ShieldCheck size={15} /> PRIVAT & AMAN</span></div>
+     
       <div className="voice-layout">
-        <section className="voice-console">
+               <section className="voice-console">
+         
           <div className="voice-console-header"><div><span className="console-icon"><AudioLines size={17} /></span><span><strong>Studio transkripsi</strong><small>{browserMode ? 'Pengenal suara browser · Bahasa Indonesia' : 'Whisper lokal · Bahasa Indonesia'}</small></span></div><span className={`listening-status ${listening ? 'is-listening' : ''} ${voiceStatus === 'done' ? 'is-done' : ''} ${startingRecording || voiceStatus === 'processing' ? 'is-processing' : ''}`}><i /> {startingRecording && <LoaderCircle className="voice-loading-icon" size={12} />}{statusLabel}</span></div>
           <div className={`wave-stage ${listening ? 'wave-active' : ''}`}>
             <span className="wave-stage-ring ring-one" /><span className="wave-stage-ring ring-two" />
@@ -1110,7 +1217,7 @@ function AboutPage({ onNavigate }) {
       <div className="about-pillars">
         <div><span><HeartHandshake size={20} /></span><strong><em>01.</em> Membantu komunikasi</strong><p>Menyediakan alat bantu yang mengubah gestur tertentu menjadi teks dan suara, serta ucapan menjadi teks.</p></div>
         <div><span><HeartHandshake size={20} /></span><strong><em>02.</em> Mendukung akses yang setara</strong><p>Mendorong pengalaman layanan dan komunikasi yang lebih mudah diakses oleh pengguna dengan kebutuhan yang beragam.</p></div>
-        <div><span><Zap size={20} /></span><strong><em>03.</em> Mengembangkan teknologi inklusif</strong><p>Menggunakan model pengenalan gestur dan teknologi transkripsi suara sebagai alat bantu komunikasi.</p></div>
+        <div><span><Zap size={20} /></span><strong><em>03.</em> Mengembangkan teknologi inklusif</strong><p> menggunakan model pengenalan gestur dan teknologi transkripsi suara sebagai alat bantu komunikasi.</p></div>
         <div><span><ShieldCheck size={20} /></span><strong><em>04.</em> Menjelaskan penggunaan data</strong><p>Kamera diproses di perangkat. Pada mode suara di situs online, browser dapat menggunakan layanan pengenalan suara online.</p></div>
         <div><span><HeartHandshake size={20} /></span><strong><em>05.</em> Belajar bersama pengguna</strong><p>Masukan pengguna membantu BISARA memperbaiki kemudahan penggunaan, kejelasan informasi, dan dukungan gestur.</p></div>
       </div>
